@@ -82,6 +82,8 @@ class TokenType(StrEnum):
     UNIQUE = "UNIQUE"
     AUTO_INCREMENT = "AUTO_INCREMENT"
     IS = "IS"
+    GROUP = "GROUP"
+    HAVING = "HAVING"
 
     # Literals and Identifiers
     IDENTIFIER = "IDENTIFIER"
@@ -145,6 +147,8 @@ KEYWORDS: dict[str, TokenType] = {
     "AUTO_INCREMENT": TokenType.AUTO_INCREMENT,
     "AUTOINCREMENT": TokenType.AUTO_INCREMENT,
     "IS": TokenType.IS,
+    "GROUP": TokenType.GROUP,
+    "HAVING": TokenType.HAVING,
 }
 
 
@@ -744,11 +748,13 @@ class InsertStatement(Statement):
 
 @dataclass
 class SelectStatement(Statement):
-    """SELECT statement with projections, table, joins, where, order by, limit."""
+    """SELECT statement with projections, table, joins, where, group by, having, order by, limit."""
     projections: list[SelectItem]
     from_table: Optional[TableRef] = None
     joins: list[JoinClause] = field(default_factory=list)
     where: Optional[Expression] = None
+    group_by: Optional[list[Expression]] = None
+    having: Optional[Expression] = None
     order_by: Optional[list[OrderByItem]] = None
     limit: Optional[int] = None
     distinct: bool = False
@@ -797,6 +803,10 @@ class SelectStatement(Statement):
             s += f" {j}"
         if self.where:
             s += f" WHERE {self.where}"
+        if self.group_by:
+            s += f" GROUP BY {', '.join(str(g) for g in self.group_by)}"
+        if self.having:
+            s += f" HAVING {self.having}"
         if self.order_by:
             s += f" ORDER BY {', '.join(str(o) for o in self.order_by)}"
         if self.limit is not None:
@@ -1101,6 +1111,8 @@ CLAUSE_START_KEYWORDS = {
     TokenType.CROSS,
     TokenType.ORDER,
     TokenType.LIMIT,
+    TokenType.GROUP,
+    TokenType.HAVING,
     TokenType.SEMICOLON,
     TokenType.EOF,
     TokenType.COMMA,
@@ -1435,6 +1447,19 @@ class Parser:
         if self.match(TokenType.WHERE):
             where_clause = self.parse_expression()
 
+        group_by: Optional[list[Expression]] = None
+        if self.match(TokenType.GROUP):
+            self.consume(TokenType.BY, "Expected 'BY' after 'GROUP'")
+            group_by = []
+            while True:
+                group_by.append(self.parse_expression())
+                if not self.match(TokenType.COMMA):
+                    break
+
+        having_clause: Optional[Expression] = None
+        if self.match(TokenType.HAVING):
+            having_clause = self.parse_expression()
+
         order_by: Optional[list[OrderByItem]] = None
         if self.match(TokenType.ORDER):
             self.consume(TokenType.BY, "Expected 'BY' after 'ORDER'")
@@ -1460,6 +1485,8 @@ class Parser:
             from_table=from_table,
             joins=joins,
             where=where_clause,
+            group_by=group_by,
+            having=having_clause,
             order_by=order_by,
             limit=limit,
             distinct=distinct,
