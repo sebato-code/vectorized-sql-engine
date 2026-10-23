@@ -1,15 +1,16 @@
 #!/bin/sh
-REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+SCRIPT_DIR="$(dirname "$0")"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH}"
-cd "${REPO_ROOT}"
+
 if command -v pytest >/dev/null 2>&1; then
-    exec pytest -c "${REPO_ROOT}/pyproject.toml" "$@"
+    exec pytest "$@"
 elif [ -x /usr/bin/pytest ]; then
-    exec /usr/bin/pytest -c "${REPO_ROOT}/pyproject.toml" "$@"
+    exec /usr/bin/pytest "$@"
 elif command -v python3 >/dev/null 2>&1; then
-    exec python3 -m pytest -c "${REPO_ROOT}/pyproject.toml" "$@"
+    exec python3 -m pytest "$@"
 elif command -v python >/dev/null 2>&1; then
-    exec python -m pytest -c "${REPO_ROOT}/pyproject.toml" "$@"
+    exec python -m pytest "$@"
 else
     echo "pytest not found" >&2
     exit 1
