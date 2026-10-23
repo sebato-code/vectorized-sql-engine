@@ -7,6 +7,7 @@ Provides batch-oriented relational query execution:
   * ExecutionOperator: Abstract base class implementing the Volcano lifecycle
     (open, next, close) with Python iterator and context manager support.
   * SeqScan: Sequential scan over tabular data producing VectorBatches.
+  * IndexScan: Vectorized scan over disk-backed BPlusTree index (Point Lookup and Range Scan).
   * Filter: Vectorized predicate evaluation and filtering.
   * HashJoin: Two-phase in-memory Hash Join (Build and Probe).
   * Aggregate: Hash-based grouping and aggregation (GROUP BY, scalar aggregations).
@@ -38,6 +39,8 @@ from typing import (
     Tuple,
     Union,
 )
+
+from src.index.bplus_tree import BPlusTree
 
 DEFAULT_BATCH_SIZE: int = 1024
 
@@ -975,6 +978,317 @@ class SeqScan(ExecutionOperator):
     def close(self) -> None:
         super().close()
         self._cursor = 0
+
+
+# ============================================================================
+# IndexScan Operator
+# ============================================================================
+
+
+class IndexScan(ExecutionOperator):
+    """Vectorized Index Scan operator integrated with on-disk BPlusTree.
+
+    Provides high-performance vectorized scanning over a disk-backed BPlusTree index:
+    - Point Lookup: Exact key search (key == target) emitting a single tuple or empty batch.
+    - Range Scan: Key range scanning (>= low and <= high) with configurable inclusive/exclusive bounds.
+    - Full Index Scan: Sequential traversal over all indexed key-value pairs when no bounds are specified.
+    - Direct VectorBatch Emission: Constructs columnar VectorBatches directly from indexed (key, value) pairs.
+    - Projection & Column Mapping: Custom key/value column names or dict unpacking into relational columns.
+    - Volcano Lifecycle: Full open(), next(), close(), context manager, and iteration protocol support.
+    """
+
+    def __init__(
+        self,
+        index: BPlusTree,
+        key: Optional[Any] = None,
+        low_key: Optional[Any] = None,
+        high_key: Optional[Any] = None,
+        inclusive_low: bool = True,
+        inclusive_high: bool = True,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        key_column: str = "key",
+        value_column: str = "value",
+        columns: Optional[Sequence[str]] = None,
+        projection: Optional[Sequence[str]] = None,
+        *,
+        low: Optional[Any] = None,
+        high: Optional[Any] = None,
+        start_key: Optional[Any] = None,
+        end_key: Optional[Any] = None,
+        point_key: Optional[Any] = None,
+        exact_key: Optional[Any] = None,
+        inclusive_start: Optional[bool] = None,
+        inclusive_end: Optional[bool] = None,
+    ) -> None:
+        super().__init__()
+        if index is None:
+            raise ValueError("index cannot be None")
+        if not isinstance(index, BPlusTree) and not (
+            hasattr(index, "search") and hasattr(index, "range_scan")
+        ):
+            raise TypeError(f"index must be a BPlusTree instance, got {type(index).__name__}")
+
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
+
+        self._index: BPlusTree = index
+        self._batch_size: int = batch_size
+        self.key_column: str = key_column
+        self.value_column: str = value_column
+        self.projection: Optional[List[str]] = list(projection) if projection is not None else None
+        self._columns_spec: Optional[List[str]] = list(columns) if columns is not None else None
+
+        # Resolve column names if explicitly provided via columns
+        if self._columns_spec is not None:
+            if len(self._columns_spec) >= 2 and key_column == "key" and value_column == "value":
+                self.key_column = self._columns_spec[0]
+                self.value_column = self._columns_spec[1]
+            elif len(self._columns_spec) == 1 and key_column == "key":
+                self.key_column = self._columns_spec[0]
+
+        # Determine if this is a Point Lookup or a Range Scan
+        self._is_point_lookup: bool = False
+        self._point_key: Optional[Any] = None
+
+        if point_key is not None:
+            self._is_point_lookup = True
+            self._point_key = point_key
+        elif exact_key is not None:
+            self._is_point_lookup = True
+            self._point_key = exact_key
+        elif (
+            key is not None
+            and low_key is None
+            and high_key is None
+            and low is None
+            and high is None
+            and start_key is None
+            and end_key is None
+        ):
+            self._is_point_lookup = True
+            self._point_key = key
+
+        # Handle positional args: IndexScan(index, 10, 20) -> low=10, high=20
+        if not self._is_point_lookup:
+            if key is not None and low_key is not None and high_key is None:
+                high_key = low_key
+                low_key = key
+                key = None
+
+        self._low_key: Optional[Any] = (
+            low_key if low_key is not None else (low if low is not None else start_key)
+        )
+        self._high_key: Optional[Any] = (
+            high_key if high_key is not None else (high if high is not None else end_key)
+        )
+        self._inclusive_low: bool = (
+            inclusive_low if inclusive_start is None else inclusive_start
+        )
+        self._inclusive_high: bool = (
+            inclusive_high if inclusive_end is None else inclusive_end
+        )
+
+        # Execution cursor & cached pairs
+        self._matched_pairs: List[Tuple[Any, Any]] = []
+        self._cursor: int = 0
+        self._columns_schema: Optional[List[str]] = None
+
+    @property
+    def index(self) -> BPlusTree:
+        """Return the underlying BPlusTree index."""
+        return self._index
+
+    @property
+    def batch_size(self) -> int:
+        """Return batch size."""
+        return self._batch_size
+
+    @property
+    def is_point_lookup(self) -> bool:
+        """Return True if configured for point lookup."""
+        return self._is_point_lookup
+
+    @property
+    def is_range_scan(self) -> bool:
+        """Return True if configured for range scan."""
+        return not self._is_point_lookup
+
+    @property
+    def point_key(self) -> Optional[Any]:
+        """Return target key for point lookup, or None."""
+        return self._point_key
+
+    @property
+    def low_key(self) -> Optional[Any]:
+        """Return lower bound of range scan."""
+        return self._low_key
+
+    @property
+    def high_key(self) -> Optional[Any]:
+        """Return upper bound of range scan."""
+        return self._high_key
+
+    @property
+    def inclusive_low(self) -> bool:
+        """Return True if lower bound is inclusive."""
+        return self._inclusive_low
+
+    @property
+    def inclusive_high(self) -> bool:
+        """Return True if upper bound is inclusive."""
+        return self._inclusive_high
+
+    @property
+    def columns(self) -> Optional[List[str]]:
+        """Return output column schema names."""
+        if self.projection is not None:
+            return list(self.projection)
+        if self._columns_spec is not None:
+            return list(self._columns_spec)
+        if self._columns_schema is not None:
+            return list(self._columns_schema)
+        return [self.key_column, self.value_column]
+
+    def open(self) -> None:
+        """Initialize the scan and fetch matching entries from the index."""
+        super().open()
+        self._cursor = 0
+        self._matched_pairs.clear()
+
+        if self._is_point_lookup:
+            # Exact search (Point Lookup)
+            val = self._index.search(self._point_key)
+            if val is not None:
+                self._matched_pairs = [(self._point_key, val)]
+            else:
+                # Value might be None or key does not exist; verify with range_scan
+                pairs = self._index.range_scan(
+                    start_key=self._point_key,
+                    end_key=self._point_key,
+                    inclusive_start=True,
+                    inclusive_end=True,
+                )
+                if pairs:
+                    self._matched_pairs = pairs
+        else:
+            # Range scan (>= low and <= high)
+            if (
+                self._low_key is not None
+                and self._high_key is not None
+                and self._low_key > self._high_key
+            ):
+                self._matched_pairs = []
+            else:
+                self._matched_pairs = self._index.range_scan(
+                    start_key=self._low_key,
+                    end_key=self._high_key,
+                    inclusive_start=self._inclusive_low,
+                    inclusive_end=self._inclusive_high,
+                )
+
+        # Resolve initial columns schema if pairs exist
+        if self._matched_pairs and self._columns_schema is None:
+            first_val = self._matched_pairs[0][1]
+            if isinstance(first_val, dict):
+                col_names = []
+                if self.key_column and self.key_column not in first_val:
+                    col_names.append(self.key_column)
+                col_names.extend(first_val.keys())
+                self._columns_schema = col_names
+            elif self._columns_spec is not None:
+                self._columns_schema = list(self._columns_spec)
+            else:
+                self._columns_schema = [self.key_column, self.value_column]
+
+    def _create_batch(self, pairs: List[Tuple[Any, Any]]) -> VectorBatch:
+        """Construct a VectorBatch from a chunk of (key, value) pairs."""
+        if not pairs:
+            cols = self.columns or [self.key_column, self.value_column]
+            return VectorBatch(data={c: [] for c in cols}, num_rows=0)
+
+        first_val = pairs[0][1]
+        if isinstance(first_val, dict):
+            # Dict values: collect all keys across dicts
+            dict_keys: List[str] = []
+            for _, v in pairs:
+                if isinstance(v, dict):
+                    for k in v.keys():
+                        if k not in dict_keys:
+                            dict_keys.append(k)
+
+            col_names: List[str] = []
+            if self.key_column and self.key_column not in dict_keys:
+                col_names.append(self.key_column)
+            col_names.extend(dict_keys)
+
+            col_data: Dict[str, List[Any]] = {c: [] for c in col_names}
+            for k, v in pairs:
+                for col in col_names:
+                    if col == self.key_column and (not isinstance(v, dict) or col not in v):
+                        col_data[col].append(k)
+                    elif isinstance(v, dict):
+                        col_data[col].append(v.get(col))
+                    else:
+                        col_data[col].append(None)
+
+            batch = VectorBatch(data=col_data, num_rows=len(pairs))
+        elif isinstance(first_val, (tuple, list)) and self._columns_spec is not None:
+            # Tuple/list values with explicit column names
+            cols = list(self._columns_spec)
+            col_data = {c: [] for c in cols}
+            if len(cols) == len(first_val) + 1:
+                # First col is key, remaining are value elements
+                for k, v in pairs:
+                    col_data[cols[0]].append(k)
+                    for idx, c in enumerate(cols[1:]):
+                        col_data[c].append(v[idx] if idx < len(v) else None)
+            else:
+                for k, v in pairs:
+                    for idx, c in enumerate(cols):
+                        col_data[c].append(v[idx] if idx < len(v) else None)
+            batch = VectorBatch(data=col_data, num_rows=len(pairs))
+        else:
+            # Scalar or generic value: key_column and value_column
+            col_data = {
+                self.key_column: [p[0] for p in pairs],
+                self.value_column: [p[1] for p in pairs],
+            }
+            batch = VectorBatch(data=col_data, num_rows=len(pairs))
+
+        if self._columns_schema is None:
+            self._columns_schema = list(batch.columns)
+
+        if self.projection is not None:
+            batch = batch.project(self.projection)
+
+        return batch
+
+    def next(self) -> Optional[VectorBatch]:
+        """Produce the next VectorBatch or None when exhausted."""
+        if not self._is_open:
+            self.open()
+
+        if self._cursor >= len(self._matched_pairs):
+            return None
+
+        chunk = self._matched_pairs[self._cursor : self._cursor + self._batch_size]
+        self._cursor += len(chunk)
+        return self._create_batch(chunk)
+
+    def close(self) -> None:
+        """Close operator and release resources."""
+        super().close()
+        self._cursor = 0
+        self._matched_pairs.clear()
+
+    def __repr__(self) -> str:
+        if self._is_point_lookup:
+            return f"IndexScan(index={self._index!r}, key={self._point_key!r})"
+        return (
+            f"IndexScan(index={self._index!r}, low_key={self._low_key!r}, "
+            f"high_key={self._high_key!r}, inclusive_low={self._inclusive_low}, "
+            f"inclusive_high={self._inclusive_high}, batch_size={self._batch_size})"
+        )
 
 
 # ============================================================================
