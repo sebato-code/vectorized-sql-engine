@@ -289,11 +289,13 @@ class Catalog:
 # ============================================================================
 
 
-def split_conjuncts(expr: Expression) -> List[Expression]:
+def split_conjuncts(expr: Optional[Expression]) -> List[Expression]:
     """Split an expression into a list of AND-connected conjuncts.
 
     For example: (A AND B) AND C -> [A, B, C].
     """
+    if expr is None:
+        return []
     if isinstance(expr, BinaryOp):
         op_str = str(expr.op).upper()
         if op_str == "AND" or op_str == BinaryOpType.AND:
@@ -308,8 +310,11 @@ def combine_conjuncts(exprs: Sequence[Expression]) -> Optional[Expression]:
     """
     if not exprs:
         return None
-    result = exprs[0]
-    for next_expr in exprs[1:]:
+    valid = [e for e in exprs if e is not None]
+    if not valid:
+        return None
+    result = valid[0]
+    for next_expr in valid[1:]:
         result = BinaryOp(left=result, op=BinaryOpType.AND, right=next_expr)
     return result
 
@@ -454,29 +459,33 @@ class PredicatePushdownRule(OptimizerRule):
             return self._pushdown_filter(child.input, combined, optimizer)
 
         if isinstance(child, LogicalProjection):
-            # Check if all predicates reference only columns present in projection child
-            can_push = True
+            proj_aliases = {item.alias for item in child.expressions if item.alias}
+            pushable: List[Expression] = []
+            non_pushable: List[Expression] = []
+
             for pred in predicates:
                 refs = get_referenced_columns(pred)
-                # If references an alias created by projection, cannot push naively
-                for tbl, col in refs:
-                    for item in child.expressions:
-                        if item.alias and item.alias == col:
-                            can_push = False
-                            break
-                    if not can_push:
-                        break
-                if not can_push:
-                    break
+                if any(col in proj_aliases for _, col in refs):
+                    non_pushable.append(pred)
+                else:
+                    pushable.append(pred)
 
-            if can_push:
-                new_input = self._pushdown_filter(child.input, predicates, optimizer)
-                return LogicalProjection(input=new_input, expressions=child.expressions)
+            if pushable:
+                new_input = self._pushdown_filter(child.input, pushable, optimizer)
             else:
-                # Keep filter above projection, but optimize under projection
-                comb = combine_conjuncts(predicates)
-                new_input = self._pushdown(child, optimizer)
-                return LogicalFilter(input=new_input, condition=comb) if comb else new_input
+                new_input = self._pushdown(child.input, optimizer)
+
+            new_proj = LogicalProjection(input=new_input, expressions=child.expressions)
+            if non_pushable:
+                comb = combine_conjuncts(non_pushable)
+                return LogicalFilter(input=new_proj, condition=comb) if comb else new_proj
+            return new_proj
+
+        if isinstance(child, LogicalLimit):
+            new_input = self._pushdown(child.input, optimizer)
+            new_limit = LogicalLimit(input=new_input, limit=child.limit)
+            comb = combine_conjuncts(predicates)
+            return LogicalFilter(input=new_limit, condition=comb) if comb else new_limit
 
         # Child is LogicalScan or LogicalIndexScan or other leaf:
         comb = combine_conjuncts(predicates)

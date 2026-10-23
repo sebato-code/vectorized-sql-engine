@@ -48,6 +48,7 @@ from src.query.optimizer import (
     OptimizerRule,
     PredicatePushdownRule,
     ProjectionPruningRule,
+    RuleApplicationError,
     RuleBasedOptimizer,
     combine_conjuncts,
     get_plan_tables,
@@ -1035,3 +1036,146 @@ class TestCombinedOptimizerPipeline:
         for rule in optimizer.rules:
             assert isinstance(rule.name, str)
             assert len(rule.name) > 0
+
+
+# ============================================================================
+# 6. Edge Cases & Exception Hierarchy Tests
+# ============================================================================
+
+
+class TestOptimizerEdgeCasesAndExceptions:
+    """Tests for exception classes, partial pushdowns, inverted ranges, and catalog edge cases."""
+
+    def test_exception_hierarchy(self) -> None:
+        assert issubclass(RuleApplicationError, OptimizerError)
+        assert issubclass(OptimizerError, Exception)
+
+        with pytest.raises(RuleApplicationError):
+            raise RuleApplicationError("Rule failed")
+
+        with pytest.raises(OptimizerError):
+            raise RuleApplicationError("Rule failed")
+
+    def test_split_and_combine_conjuncts_edge_cases(self) -> None:
+        assert split_conjuncts(None) == []
+        assert combine_conjuncts([]) is None
+        assert combine_conjuncts([None]) is None  # type: ignore[list-item]
+
+        single = BinaryOp(ColumnRef("a"), "=", Literal(1))
+        assert split_conjuncts(single) == [single]
+        assert combine_conjuncts([single]) == single
+
+    def test_filter_above_limit_optimizes_limit_child(
+        self, optimizer: RuleBasedOptimizer
+    ) -> None:
+        # Construct: Filter over Limit over Join
+        join = LogicalJoin(
+            left=LogicalScan("users", alias="u"),
+            right=LogicalScan("orders", alias="o"),
+            join_type=JoinType.INNER,
+            condition=BinaryOp(
+                BinaryOp(ColumnRef("id", "u"), "=", ColumnRef("user_id", "o")),
+                BinaryOpType.AND,
+                BinaryOp(ColumnRef("age", "u"), ">", Literal(18)),
+            ),
+        )
+        limit_node = LogicalLimit(input=join, limit=10)
+        filter_node = LogicalFilter(
+            input=limit_node,
+            condition=BinaryOp(ColumnRef("status"), "=", Literal("active")),
+        )
+
+        optimized = optimizer.pushdown_predicates(filter_node)
+        # Filter must remain above Limit
+        assert isinstance(optimized, LogicalFilter)
+        assert isinstance(optimized.input, LogicalLimit)
+        # Inside limit, join condition with age > 18 was pushed into users
+        inner_join = optimized.input.input
+        assert isinstance(inner_join, LogicalJoin)
+        assert isinstance(inner_join.left, LogicalFilter)
+        assert inner_join.left.input.table_name == "users"
+
+    def test_projection_partial_pushdown_with_aliases(
+        self, optimizer: RuleBasedOptimizer
+    ) -> None:
+        scan = LogicalScan(table_name="users")
+        proj = LogicalProjection(
+            input=scan,
+            expressions=[
+                SelectItem(ColumnRef("id"), alias="uid"),
+                SelectItem(ColumnRef("age")),
+            ],
+        )
+        # uid = 10 cannot push (uid is alias), but age > 18 CAN push
+        filter_node = LogicalFilter(
+            input=proj,
+            condition=BinaryOp(
+                BinaryOp(ColumnRef("uid"), "=", Literal(10)),
+                BinaryOpType.AND,
+                BinaryOp(ColumnRef("age"), ">", Literal(18)),
+            ),
+        )
+
+        optimized = optimizer.pushdown_predicates(filter_node)
+        assert isinstance(optimized, LogicalFilter)
+        assert optimized.condition.left == ColumnRef("uid")
+        assert isinstance(optimized.input, LogicalProjection)
+        # Child scan received age > 18 filter!
+        assert isinstance(optimized.input.input, LogicalFilter)
+        assert optimized.input.input.condition.left == ColumnRef("age")
+
+    def test_inverted_literal_range_operators(self, optimizer: RuleBasedOptimizer) -> None:
+        # 18 < age -> age > 18
+        plan1 = parse_logical_plan("SELECT name FROM users WHERE 18 < age")
+        opt1 = optimizer.select_indexes(plan1)
+        assert isinstance(opt1.input, LogicalIndexScan)
+        assert opt1.input.operator == ">"
+        assert opt1.input.value == 18
+        assert opt1.input.inclusive_start is False
+
+        # 60 >= age -> age <= 60
+        plan2 = parse_logical_plan("SELECT name FROM users WHERE 60 >= age")
+        opt2 = optimizer.select_indexes(plan2)
+        assert isinstance(opt2.input, LogicalIndexScan)
+        assert opt2.input.operator == "<="
+        assert opt2.input.value == 60
+        assert opt2.input.inclusive_end is True
+
+    def test_reversed_bounded_range_between(self, optimizer: RuleBasedOptimizer) -> None:
+        # Upper bound first, then lower bound: age <= 50 AND age >= 25
+        plan = parse_logical_plan("SELECT name FROM users WHERE age <= 50 AND age >= 25")
+        opt = optimizer.select_indexes(plan)
+        assert isinstance(opt.input, LogicalIndexScan)
+        assert opt.input.operator == "BETWEEN"
+        assert opt.input.start_key == 25
+        assert opt.input.end_key == 50
+
+    def test_optimize_plan_alias_function(self, sample_catalog: Catalog) -> None:
+        plan = parse_logical_plan("SELECT id FROM users WHERE id = 1")
+        res1 = optimize(plan, catalog=sample_catalog)
+        res2 = optimize_plan(plan, catalog=sample_catalog)
+        assert str(res1) == str(res2)
+        assert isinstance(res1.input, LogicalIndexScan)
+
+    def test_multi_index_selection_in_join(self, optimizer: RuleBasedOptimizer) -> None:
+        sql = """
+        SELECT u.id, o.order_id
+        FROM users u
+        JOIN orders o ON u.id = o.user_id
+        WHERE u.id = 10 AND o.order_id = 99
+        """
+        plan = parse_logical_plan(sql)
+        optimized = optimizer.optimize(plan)
+
+        assert isinstance(optimized, LogicalProjection)
+        join = optimized.input
+        assert isinstance(join, LogicalJoin)
+        # Both sides converted to LogicalIndexScan!
+        assert isinstance(join.left, LogicalIndexScan)
+        assert join.left.index_column == "id"
+        assert join.left.value == 10
+
+        assert isinstance(join.right, LogicalIndexScan)
+        assert join.right.index_column == "order_id"
+        assert join.right.value == 99
+
