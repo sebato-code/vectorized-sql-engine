@@ -1,0 +1,13 @@
+#!/bin/sh
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH}"
+if command -v python3 >/dev/null 2>&1; then
+    exec python3 "$@"
+elif [ -x /usr/bin/python3 ]; then
+    exec /usr/bin/python3 "$@"
+elif command -v python >/dev/null 2>&1; then
+    exec python "$@"
+else
+    echo "python not found" >&2
+    exit 1
+fi
