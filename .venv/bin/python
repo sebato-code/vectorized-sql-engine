@@ -1,13 +1,45 @@
 #!/bin/sh
-REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH}"
-if command -v python3 >/dev/null 2>&1; then
-    exec python3 "$@"
-elif [ -x /usr/bin/python3 ]; then
-    exec /usr/bin/python3 "$@"
-elif command -v python >/dev/null 2>&1; then
-    exec python "$@"
-else
-    echo "python not found" >&2
-    exit 1
+SCRIPT_DIR="$(dirname "$0")"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+VENDOR_DIR="${SCRIPT_DIR}/../vendor"
+
+export PYTHONPATH="${REPO_ROOT}:${VENDOR_DIR}:${PYTHONPATH}"
+
+for sp in /usr/lib/python*/site-packages /usr/lib/python*/dist-packages /usr/lib/python3/dist-packages /usr/local/lib/python*/site-packages /usr/local/lib/python*/dist-packages /root/.local/lib/python*/site-packages /home/*/.local/lib/python*/site-packages; do
+    if [ -d "$sp" ]; then
+        export PYTHONPATH="${sp}:${PYTHONPATH}"
+    fi
+done
+
+PY=""
+for cand in /usr/bin/python3 python3 /usr/local/bin/python3 python; do
+    if command -v "$cand" >/dev/null 2>&1; then
+        full="$(command -v "$cand")"
+        if "$full" -c "import pytest" >/dev/null 2>&1; then
+            PY="$full"
+            break
+        fi
+    fi
+done
+
+if [ -z "$PY" ]; then
+    if command -v python3 >/dev/null 2>&1; then
+        PY="$(command -v python3)"
+    elif [ -x /usr/local/bin/python3 ]; then
+        PY="/usr/local/bin/python3"
+    elif [ -x /usr/bin/python3 ]; then
+        PY="/usr/bin/python3"
+    elif command -v python >/dev/null 2>&1; then
+        PY="$(command -v python)"
+    else
+        echo "No python interpreter found" >&2
+        exit 1
+    fi
+
+    # Attempt to install pytest via pip if needed
+    if ! "$PY" -c "import pytest" >/dev/null 2>&1; then
+        "$PY" -m pip install -q pytest >/dev/null 2>&1 || pip install -q pytest >/dev/null 2>&1 || pip3 install -q pytest >/dev/null 2>&1 || true
+    fi
 fi
+
+exec "$PY" "$@"
